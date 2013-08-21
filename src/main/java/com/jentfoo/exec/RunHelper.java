@@ -1,0 +1,388 @@
+package com.jentfoo.exec;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.concurrent.Executor;
+
+import org.threadly.util.ExceptionUtils;
+
+public class RunHelper {
+  private static final boolean VERBOSE = false;
+  private static final int STD_BUFFER_SIZE = 512;
+  private static final String EXEC_NOTIFY_STRING = "b675817dbcb7675b93341b69991ddaf39ff7c80a"; // echo "RUNNING FOR THE WIN" | sha1sum -
+  private static int MAX_CONCURRENT_FORKS = 1;
+  private static String DEFAULT_SHELL = "/bin/dash";
+  private static final String SHELL_EXECUTE_FLAG = "-c";
+  
+  /**
+   * this does not limit how many programs can be running at once, 
+   * but rather how many can be forked at a time before exec is called 
+   * This is to prevent the memory overhead of fork being called 
+   * multiple times before exec has been called to reduce the memory pressure
+   * 
+   * @param val maximum processes that can be forked but not exec'ed
+   */
+  public static void setMaxConcurrentForks(int val) {
+    if (val < 1) {
+      throw new IllegalArgumentException("must be >= 1");
+    }
+    
+    MAX_CONCURRENT_FORKS = val;
+  }
+  
+  public static void setDefaultShell(String path) {
+    path = path == null ? null : path.trim();
+    if (path == null || path.length() == 0) {
+      throw new IllegalArgumentException("Must provide a valid shell path");
+    }
+    // TODO - do we want to verify it exists and can execute?
+    
+    DEFAULT_SHELL = path;
+  }
+  
+  public static RunningProcess execCommand(Executor executor, 
+                                           String command, 
+                                           boolean storeStdOut) throws IOException, 
+                                                                       InterruptedException {
+    return execCommand(executor, command, storeStdOut, false);
+  }
+  
+  public static RunningProcess execCommand(Executor executor, 
+                                           String command, 
+                                           boolean storeStdOut, 
+                                           boolean forceLog) throws IOException, 
+                                                                    InterruptedException {
+    String[] shellCommand = {DEFAULT_SHELL,
+                             SHELL_EXECUTE_FLAG,
+                             command
+                            };
+    
+    return execCommand(executor, shellCommand, storeStdOut, forceLog);
+  }
+  
+  public static RunningProcess execCommand(Executor executor, 
+                                           String[] command, 
+                                           boolean storeStdOut) throws IOException, 
+                                                                       InterruptedException {
+    return execCommand(executor, command, storeStdOut, false);
+  }
+  
+  public static RunningProcess execCommand(Executor executor, 
+                                           String[] originalCommand, 
+                                           boolean storeStdOut, 
+                                           boolean forceLog) throws IOException, 
+                                                                    InterruptedException {
+    ForkLock forkLock = getAndAcquireForkLock(originalCommand);  // lock is released by ExecResult when it consumes stdOut
+    maybeLog(originalCommand, forceLog);
+    try {
+      return new RunningProcess(executor, storeStdOut, forkLock);
+    } catch (IOException e) {
+      // release on error
+      forkLock.release();
+
+      throw e;
+    } catch (Throwable t) {
+      // release on error
+      forkLock.release();
+
+      throw ExceptionUtils.makeRuntime(t);
+    }
+  }
+  
+  private static ForkLock getAndAcquireForkLock(String[] originalCommand) throws InterruptedException {
+    ForkLock fl = new ForkLock(originalCommand);
+    fl.acquire();
+    return fl;
+  }
+  
+  private static boolean startsWithShell(String[] command) {
+    return command[0].endsWith("sh") || 
+           command[0].endsWith("bash") || 
+           command[0].endsWith("dash") || 
+           command[0].endsWith("zsh") || 
+           command[0].endsWith("ksh") || 
+           command[0].endsWith("ash");
+  }
+  
+  private static void maybeLog(String[] command, boolean forceLog) {
+    if (forceLog || VERBOSE) {
+      if (startsWithShell(command) && command.length == 3) {
+        System.out.println("Running command: " + command[2]);
+      } else {
+        System.out.println("Running command: \n" + getCommandStr(command, true));
+      }
+    }
+  }
+  
+  private static String getCommandStr(String[] command, boolean formatedForLogging) {
+    return getCommandStr(command, 0, formatedForLogging);
+  }
+  
+  private static String getCommandStr(String[] command, int startIndex, 
+                                      boolean formatedForLogging) {
+    if (startIndex > command.length) {
+      throw new IndexOutOfBoundsException(startIndex + " is beyond array of length " + command.length);
+    }
+    
+    boolean first = true;
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < command.length; i++) {
+      if (i < startIndex) {
+        continue;
+      }
+      if (! first) {
+        if (formatedForLogging) {
+          sb.append('\n');
+        } else {
+          sb.append(' ');
+        }
+      } else {
+        first = false;
+      }
+      if (formatedForLogging) {
+        sb.append('\t');
+      }
+      sb.append(command[i]);
+    }
+    return sb.toString();
+  }
+  
+  private static class ForkLock {
+    private static final Object forkLock = new Object();
+    private static int currentForkQty = 0;
+
+    private final String lockNotifyStr;
+    private boolean acquired;
+    private boolean released;
+    private final String[] commandWithLock;
+    
+    public ForkLock(String[] originalCommand) {
+      lockNotifyStr = EXEC_NOTIFY_STRING;
+      acquired = false;
+      released = false;
+      
+      String lockEchoCommand = "echo -n \'" + lockNotifyStr + "\' ; ";
+      if (startsWithShell(originalCommand)) {
+        if (! originalCommand[1].trim().equals(SHELL_EXECUTE_FLAG)) {
+          throw new IllegalStateException("Unexpected command input, " +
+                                            "expected shell followed by " + SHELL_EXECUTE_FLAG + ", " +
+                                            "got: \n" + getCommandStr(originalCommand, true));
+        }
+        
+        commandWithLock = new String[3];
+        commandWithLock[0] = originalCommand[0];
+        commandWithLock[1] = originalCommand[1];
+        commandWithLock[2] = lockEchoCommand + getCommandStr(originalCommand, 2, false);
+      } else {
+        commandWithLock = new String[3];
+        commandWithLock[0] = DEFAULT_SHELL;
+        commandWithLock[1] = SHELL_EXECUTE_FLAG;
+        commandWithLock[2] = lockEchoCommand + getCommandStr(originalCommand, 0, false);
+      }
+    }
+    
+    public void acquire() throws InterruptedException {
+      synchronized (forkLock) {
+        if (acquired) { // prevent acquiring multiple times
+          if (released) {
+            throw new IllegalStateException("Lock already acquired and released, " +
+                                              "don't reuse lock objects");
+          }
+          return;
+        }
+        
+        while (currentForkQty >= MAX_CONCURRENT_FORKS) {
+          forkLock.wait();
+        }
+        
+        currentForkQty++;
+        acquired = true;
+      }
+    }
+
+    
+    private void release() {
+      synchronized (forkLock) {
+        if (! acquired) {
+          throw new IllegalStateException("Can not release lock thas has never been acquired");
+        }
+
+        if (released) { // prevent being released multiple times
+          return;
+        }
+
+        currentForkQty--;
+        released = true;
+        forkLock.notify();
+      }
+    }
+    
+    @Override
+    protected void finalize() {
+      if (acquired && ! released) {
+        System.err.println("ForkLock was acquired and never releaed, releasing in finalizer");
+        release();
+      }
+    }
+  }
+  
+  public static class RunningProcess {
+    private final ExecOutput output;
+    private final Process process;
+    private volatile Integer exitValue;
+    
+    private RunningProcess(Executor executor, final Process p, 
+                           final boolean storeStdOut) {
+      this(executor, p, storeStdOut, null);
+    }
+    
+    private RunningProcess(Executor executor, boolean storeStdOut, ForkLock forkLock) throws IOException {
+      this(executor, 
+           Runtime.getRuntime().exec(forkLock.commandWithLock), 
+           storeStdOut, forkLock);
+    }
+    
+    private RunningProcess(Executor executor, 
+                           final Process p, 
+                           final boolean storeStdOut, 
+                           final ForkLock forkLock) {
+      if (forkLock != null && ! forkLock.acquired) {
+        throw new IllegalStateException("Provided a ForkLock that is not acquired yet");
+      }
+      
+      output = new ExecOutput();
+      process = p;
+      exitValue = null;
+      
+      // TODO - execute thread which reads from std out and std error from the process and outputs to the ExecOutput
+      // TODO - once streams are done, notify on output and mark stdStreamsDone
+    }
+
+    public void blockTillFinished() throws InterruptedException {
+      if (exitValue != null) {
+        return;
+      }
+        
+      // block till we have results from both std out and std error
+      synchronized (output) {
+        while (! output.stdStreamsDone) {
+          output.wait();
+        }
+      }
+        
+      exitValue = process.waitFor();
+    }
+    
+    public int exitValue() throws InterruptedException {
+      blockTillFinished();
+      
+      return exitValue;
+    }
+    
+    public void checkExitValue() throws InterruptedException {
+      checkExitValue(null);
+    }
+    
+    public void checkExitValue(String errorMsg) throws InterruptedException {
+      if (exitValue() != 0) {
+        throw new BadExitCodeException(exitValue, errorMsg);
+      }
+    }
+    
+    public String stdOutStr() throws InterruptedException {
+      blockTillFinished();
+      
+      return null; // TODO - read from entire stream and return single string result
+    }
+    
+    public String stdErrStr() throws InterruptedException {
+      blockTillFinished();
+      
+      return null; // TODO - read from entire stream and return single string result
+    }
+    
+    public InputStream stdOut() {
+      return output.stdOut;
+    }
+    
+    public InputStream stdErr() {
+      return output.stdErr;
+    }
+    
+    public void pipeToStdIn(OutputStream stream) {
+      // TODO - implement
+    }
+    
+    private static String readStream(InputStream in, 
+                                     boolean saveOutput, 
+                                     ForkLock forkLock) throws IOException {
+      
+      StringBuffer resultSB;
+      if (saveOutput) {
+        resultSB = new StringBuffer();
+      } else {
+        resultSB = null;
+      }
+      boolean needToReleaseForkLock;
+      StringBuffer tempSB;
+      
+      if (forkLock == null) {
+        // if we are not asked to notify, then we already notified
+        needToReleaseForkLock = false;
+        tempSB = null;
+      } else {
+        needToReleaseForkLock = true;
+        tempSB = new StringBuffer();
+      }
+      
+      byte[] buffer = new byte[STD_BUFFER_SIZE];
+      int c = 0;
+      while ((c = in.read(buffer)) != -1) {
+        if (needToReleaseForkLock) {
+          tempSB.append(new String(buffer, 0, c));
+          String currStr = tempSB.toString();
+          
+          if (currStr.startsWith(forkLock.lockNotifyStr)) {
+            forkLock.release();
+            
+            needToReleaseForkLock = false;
+            
+            // if we read more than our lock string put it into the result buffer
+            if (saveOutput && 
+                currStr.length() != forkLock.lockNotifyStr.length()) {
+              resultSB.append(currStr.substring(forkLock.lockNotifyStr.length()));
+            }
+            
+            tempSB = null;  // no longer needed
+          }
+        } else if (saveOutput) {
+          resultSB.append(new String(buffer, 0, c));
+        }
+      }
+      
+      if (needToReleaseForkLock) {
+        throw new IllegalStateException("Never found lock key: " + forkLock + 
+                                          ", stdOut: \n\t" + tempSB.toString());
+      }
+      
+      if (saveOutput) {
+        return resultSB.toString();
+      } else {
+        return "";
+      }
+    }
+  }
+  
+  private static class ExecOutput {
+    private final ProcessInputStream stdOut;
+    private final ProcessInputStream stdErr;
+    private boolean stdStreamsDone;
+    
+    public ExecOutput() {
+      stdOut = new ProcessInputStream();
+      stdErr = new ProcessInputStream();
+      stdStreamsDone = false;
+    }
+  }
+}
