@@ -231,6 +231,8 @@ public class RunHelper {
     private final Executor executor;
     private final ExecOutput output;
     private final Process process;
+    private String stdOutStr;
+    private String stdErrStr;
     private volatile Integer exitValue;
     
     private RunningProcess(Executor executor, 
@@ -258,6 +260,8 @@ public class RunHelper {
       this.executor = executor;
       output = new ExecOutput();
       process = p;
+      stdOutStr = null;
+      stdErrStr = null;
       exitValue = null;
       if (storeStdOut) {
         executor.execute(new StreamPiper(process.getInputStream(), 
@@ -313,87 +317,50 @@ public class RunHelper {
       }
     }
     
-    public String stdOutStr() throws InterruptedException {
-      blockTillFinished();
+    public synchronized String stdOutStr() throws InterruptedException, IOException {
+      if (stdOutStr == null) {
+        blockTillFinished();
+        
+        stdOutStr = streamToString(output.stdOut);
+      }
       
-      return null; // TODO - read from entire stream and return single string result
+      return stdOutStr;
     }
     
-    public String stdErrStr() throws InterruptedException {
-      blockTillFinished();
+    public synchronized String stdErrStr() throws InterruptedException, IOException {
+      if (stdErrStr == null) {
+        blockTillFinished();
+        
+        stdErrStr = streamToString(output.stdErr);
+      }
       
-      return null; // TODO - read from entire stream and return single string result
+      return stdErrStr;
     }
     
+    /*
+     * TODO - implement these in a way that wont conflict with stdOutStr
     public InputStream stdOut() {
       return output.stdOut;
     }
     
     public InputStream stdErr() {
       return output.stdErr;
-    }
+    }*/
     
     public void pipeToStdIn(InputStream stream) {
       executor.execute(new StreamPiper(stream, true, process.getOutputStream(), true, null, null));
     }
     
-    private static String readStream(InputStream in, 
-                                     boolean saveOutput, 
-                                     ForkLock forkLock) throws IOException {
-      
-      StringBuffer resultSB;
-      if (saveOutput) {
-        resultSB = new StringBuffer();
-      } else {
-        resultSB = null;
-      }
-      boolean needToReleaseForkLock;
-      StringBuffer tempSB;
-      
-      if (forkLock == null) {
-        // if we are not asked to notify, then we already notified
-        needToReleaseForkLock = false;
-        tempSB = null;
-      } else {
-        needToReleaseForkLock = true;
-        tempSB = new StringBuffer();
-      }
+    private static String streamToString(InputStream in) throws IOException {
+      StringBuffer resultSB = new StringBuffer();
       
       byte[] buffer = new byte[STD_BUFFER_SIZE];
       int c = 0;
       while ((c = in.read(buffer)) != -1) {
-        if (needToReleaseForkLock) {
-          tempSB.append(new String(buffer, 0, c));
-          String currStr = tempSB.toString();
-          
-          if (currStr.startsWith(forkLock.lockNotifyStr)) {
-            forkLock.release();
-            
-            needToReleaseForkLock = false;
-            
-            // if we read more than our lock string put it into the result buffer
-            if (saveOutput && 
-                currStr.length() != forkLock.lockNotifyStr.length()) {
-              resultSB.append(currStr.substring(forkLock.lockNotifyStr.length()));
-            }
-            
-            tempSB = null;  // no longer needed
-          }
-        } else if (saveOutput) {
-          resultSB.append(new String(buffer, 0, c));
-        }
+        resultSB.append(new String(buffer, 0, c));
       }
       
-      if (needToReleaseForkLock) {
-        throw new IllegalStateException("Never found lock key: " + forkLock + 
-                                          ", stdOut: \n\t" + tempSB.toString());
-      }
-      
-      if (saveOutput) {
-        return resultSB.toString();
-      } else {
-        return "";
-      }
+      return resultSB.toString();
     }
   }
   
