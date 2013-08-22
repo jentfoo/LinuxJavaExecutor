@@ -9,7 +9,7 @@ import org.threadly.util.ExceptionUtils;
 
 public class RunHelper {
   private static final boolean VERBOSE = false;
-  private static final int STD_BUFFER_SIZE = 512;
+  private static final int STD_BUFFER_SIZE = 1024;
   private static final String EXEC_NOTIFY_STRING = "b675817dbcb7675b93341b69991ddaf39ff7c80a"; // echo "RUNNING FOR THE WIN" | sha1sum -
   private static int MAX_CONCURRENT_FORKS = 1;
   private static String DEFAULT_SHELL = "/bin/dash";
@@ -228,16 +228,20 @@ public class RunHelper {
   }
   
   public static class RunningProcess {
+    private final Executor executor;
     private final ExecOutput output;
     private final Process process;
     private volatile Integer exitValue;
     
-    private RunningProcess(Executor executor, final Process p, 
-                           final boolean storeStdOut) {
+    private RunningProcess(Executor executor, 
+                           Process p, 
+                           boolean storeStdOut) {
       this(executor, p, storeStdOut, null);
     }
     
-    private RunningProcess(Executor executor, boolean storeStdOut, ForkLock forkLock) throws IOException {
+    private RunningProcess(Executor executor, 
+                           boolean storeStdOut, 
+                           ForkLock forkLock) throws IOException {
       this(executor, 
            Runtime.getRuntime().exec(forkLock.commandWithLock), 
            storeStdOut, forkLock);
@@ -251,25 +255,39 @@ public class RunHelper {
         throw new IllegalStateException("Provided a ForkLock that is not acquired yet");
       }
       
+      this.executor = executor;
       output = new ExecOutput();
       process = p;
       exitValue = null;
-      
-      // TODO - execute thread which reads from std out and std error from the process and outputs to the ExecOutput
-      // TODO - once streams are done, notify on output and mark stdStreamsDone
+      executor.execute(new StreamConsumer(process.getInputStream(), 
+                                          true, 
+                                          output.stdOut.getOutputStream(),
+                                          true, 
+                                          new Runnable() {
+                                            @Override
+                                            public void run() {
+                                              output.stdOutClosed();
+                                            }
+      }));
+      executor.execute(new StreamConsumer(process.getErrorStream(), 
+                                          true, 
+                                          output.stdErr.getOutputStream(), 
+                                          true, 
+                                          new Runnable() {
+                                            @Override
+                                            public void run() {
+                                              output.stdErrClosed();
+                                            }
+      }));
     }
 
     public void blockTillFinished() throws InterruptedException {
       if (exitValue != null) {
         return;
       }
-        
+      
       // block till we have results from both std out and std error
-      synchronized (output) {
-        while (! output.stdStreamsDone) {
-          output.wait();
-        }
-      }
+      output.blockTillStdStreamsDone();
         
       exitValue = process.waitFor();
     }
@@ -310,8 +328,8 @@ public class RunHelper {
       return output.stdErr;
     }
     
-    public void pipeToStdIn(OutputStream stream) {
-      // TODO - implement
+    public void pipeToStdIn(InputStream stream) {
+      executor.execute(new StreamConsumer(stream, true, process.getOutputStream(), true, null));
     }
     
     private static String readStream(InputStream in, 
@@ -375,14 +393,91 @@ public class RunHelper {
   }
   
   private static class ExecOutput {
-    private final ProcessInputStream stdOut;
-    private final ProcessInputStream stdErr;
-    private boolean stdStreamsDone;
+    private final ProcessStream stdOut;
+    private final ProcessStream stdErr;
+    private boolean stdOutDone;
+    private boolean stdErrDone;
     
     public ExecOutput() {
-      stdOut = new ProcessInputStream();
-      stdErr = new ProcessInputStream();
-      stdStreamsDone = false;
+      stdOut = new ProcessStream();
+      stdErr = new ProcessStream();
+      stdOutDone = false;
+      stdErrDone = false;
+    }
+    
+    public void blockTillStdStreamsDone() throws InterruptedException {
+      synchronized (this) {
+        while (! stdOutDone || ! stdErrDone) {
+          wait();
+        }
+      }
+    }
+
+    public void stdOutClosed() {
+      synchronized (this) {
+        stdOutDone = true;
+        
+        notifyAll();
+      }
+    }
+    
+    public void stdErrClosed() {
+      synchronized (this) {
+        stdErrDone = true;
+        
+        notifyAll();
+      }
+    }
+  }
+  
+  private static class StreamConsumer implements Runnable {
+    private final InputStream inStream;
+    private final boolean closeInputWhenDone;
+    private final OutputStream outStream;
+    private final boolean closeOutputWhenDone;
+    private final Runnable finishRunnable;
+    
+    private StreamConsumer(InputStream inStream, 
+                           boolean closeInputWhenDone, 
+                           OutputStream outStream, 
+                           boolean closeOutputWhenDone, 
+                           Runnable finishRunnable) {
+      this.inStream = inStream;
+      this.closeInputWhenDone = closeInputWhenDone;
+      this.outStream = outStream;
+      this.closeOutputWhenDone = closeOutputWhenDone;
+      this.finishRunnable = finishRunnable;
+    }
+
+    @Override
+    public void run() {
+      try {
+        try {
+          byte[] buffer = new byte[STD_BUFFER_SIZE];
+          int readCount;
+          while ((readCount = inStream.read(buffer)) != -1) {
+            outStream.write(buffer, 0, readCount);
+          }
+        } finally {
+          try {
+            try {
+              if (closeInputWhenDone) {
+                inStream.close();
+              }
+            } finally {
+              if (closeOutputWhenDone) {
+                outStream.close();
+              }
+            }
+          } finally {
+            if (finishRunnable != null) {
+              finishRunnable.run();
+            }
+          }
+        }
+      } catch (IOException e) {
+        throw ExceptionUtils.makeRuntime(e);
+      }
     }
   }
 }
