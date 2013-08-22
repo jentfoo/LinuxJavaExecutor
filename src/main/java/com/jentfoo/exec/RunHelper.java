@@ -259,26 +259,31 @@ public class RunHelper {
       output = new ExecOutput();
       process = p;
       exitValue = null;
-      executor.execute(new StreamConsumer(process.getInputStream(), 
-                                          true, 
-                                          output.stdOut.getOutputStream(),
-                                          true, 
-                                          new Runnable() {
-                                            @Override
-                                            public void run() {
-                                              output.stdOutClosed();
-                                            }
-      }));
-      executor.execute(new StreamConsumer(process.getErrorStream(), 
-                                          true, 
-                                          output.stdErr.getOutputStream(), 
-                                          true, 
-                                          new Runnable() {
-                                            @Override
-                                            public void run() {
-                                              output.stdErrClosed();
-                                            }
-      }));
+      if (storeStdOut) {
+        executor.execute(new StreamPiper(process.getInputStream(), 
+                                         true, 
+                                         output.stdOut.getOutputStream(),
+                                         true, 
+                                         new Runnable() {
+                                           @Override
+                                           public void run() {
+                                             output.stdOutClosed();
+                                           }
+                                         }, forkLock));
+      } else {
+        output.stdOutClosed();
+        executor.execute(new StreamConsumer(process.getInputStream(), forkLock));
+      }
+      executor.execute(new StreamPiper(process.getErrorStream(), 
+                                       true, 
+                                       output.stdErr.getOutputStream(), 
+                                       true, 
+                                       new Runnable() {
+                                         @Override
+                                         public void run() {
+                                           output.stdErrClosed();
+                                         }
+                                       }, null));
     }
 
     public void blockTillFinished() throws InterruptedException {
@@ -329,7 +334,7 @@ public class RunHelper {
     }
     
     public void pipeToStdIn(InputStream stream) {
-      executor.execute(new StreamConsumer(stream, true, process.getOutputStream(), true, null));
+      executor.execute(new StreamPiper(stream, true, process.getOutputStream(), true, null, null));
     }
     
     private static String readStream(InputStream in, 
@@ -431,22 +436,13 @@ public class RunHelper {
   }
   
   private static class StreamConsumer implements Runnable {
-    private final InputStream inStream;
-    private final boolean closeInputWhenDone;
-    private final OutputStream outStream;
-    private final boolean closeOutputWhenDone;
-    private final Runnable finishRunnable;
+    private final InputStream stream;
+    private final ForkLock toReleaseLock;
     
-    private StreamConsumer(InputStream inStream, 
-                           boolean closeInputWhenDone, 
-                           OutputStream outStream, 
-                           boolean closeOutputWhenDone, 
-                           Runnable finishRunnable) {
-      this.inStream = inStream;
-      this.closeInputWhenDone = closeInputWhenDone;
-      this.outStream = outStream;
-      this.closeOutputWhenDone = closeOutputWhenDone;
-      this.finishRunnable = finishRunnable;
+    private StreamConsumer(InputStream stream, 
+                           ForkLock toReleaseLock) {
+      this.stream = stream;
+      this.toReleaseLock = toReleaseLock;
     }
 
     @Override
@@ -454,9 +450,94 @@ public class RunHelper {
       try {
         try {
           byte[] buffer = new byte[STD_BUFFER_SIZE];
+          StringBuffer tempSB = null;
+          boolean needToReleaseForkLock = false;
+          if (toReleaseLock != null) {
+            needToReleaseForkLock = true;
+            tempSB = new StringBuffer();
+          }
+          int readCount;
+          while ((readCount = stream.read(buffer)) != -1) {
+            if (needToReleaseForkLock) {
+              tempSB.append(new String(buffer, 0, readCount));
+              String currStr = tempSB.toString();
+              
+              if (currStr.startsWith(toReleaseLock.lockNotifyStr)) {
+                toReleaseLock.release();
+                
+                needToReleaseForkLock = false;
+                tempSB = null;  // no longer needed
+              }
+            }
+          }
+          
+          if (needToReleaseForkLock) {
+            throw new IllegalStateException("Never found lock key: " + toReleaseLock + 
+                                              ", stdOut: \n\t" + tempSB.toString());
+          }
+        } finally {
+          stream.close();
+        }
+      } catch (IOException e) {
+        throw ExceptionUtils.makeRuntime(e);
+      }
+    }
+  }
+  
+  private static class StreamPiper implements Runnable {
+    private final InputStream inStream;
+    private final boolean closeInputWhenDone;
+    private final OutputStream outStream;
+    private final boolean closeOutputWhenDone;
+    private final Runnable finishRunnable;
+    private final ForkLock toReleaseLock;
+    
+    private StreamPiper(InputStream inStream, 
+                        boolean closeInputWhenDone, 
+                        OutputStream outStream, 
+                        boolean closeOutputWhenDone, 
+                        Runnable finishRunnable, 
+                        ForkLock toReleaseLock) {
+      this.inStream = inStream;
+      this.closeInputWhenDone = closeInputWhenDone;
+      this.outStream = outStream;
+      this.closeOutputWhenDone = closeOutputWhenDone;
+      this.finishRunnable = finishRunnable;
+      this.toReleaseLock = toReleaseLock;
+    }
+
+    @Override
+    public void run() {
+      try {
+        try {
+          byte[] buffer = new byte[STD_BUFFER_SIZE];
+          StringBuffer tempSB = null;
+          boolean needToReleaseForkLock = false;
+          if (toReleaseLock != null) {
+            needToReleaseForkLock = true;
+            tempSB = new StringBuffer();
+          }
           int readCount;
           while ((readCount = inStream.read(buffer)) != -1) {
-            outStream.write(buffer, 0, readCount);
+            if (needToReleaseForkLock) {
+              tempSB.append(new String(buffer, 0, readCount));
+              String currStr = tempSB.toString();
+              
+              if (currStr.startsWith(toReleaseLock.lockNotifyStr)) {
+                toReleaseLock.release();
+                
+                needToReleaseForkLock = false;
+                
+                // if we read more than our lock string put it into the result stream
+                if (currStr.length() != toReleaseLock.lockNotifyStr.length()) {
+                  outStream.write(currStr.substring(toReleaseLock.lockNotifyStr.length()).getBytes());
+                }
+                
+                tempSB = null;  // no longer needed
+              }
+            } else {
+              outStream.write(buffer, 0, readCount);
+            }
           }
         } finally {
           try {

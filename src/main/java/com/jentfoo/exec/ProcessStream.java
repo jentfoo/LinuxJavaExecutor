@@ -123,6 +123,8 @@ public class ProcessStream extends InputStream {
   public void close() {
     synchronized (this) {
       closed = true;
+      
+      this.notifyAll();
     }
   }
   
