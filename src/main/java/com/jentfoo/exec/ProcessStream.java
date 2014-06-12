@@ -16,6 +16,7 @@ public class ProcessStream extends InputStream {
     closed = false;
   }
   
+  // should be synchronized on this before calling
   private void blockTillReadyToRead() {
     while (! closed && dataStream.isEmpty()) {
       try {

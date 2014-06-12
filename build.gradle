@@ -6,7 +6,7 @@ repositories {
 
 dependencies {
   testCompile group: 'junit', name: 'junit', version: '4.+'
-  compile 'org.threadly:threadly:0.6'
+  compile 'org.threadly:threadly:2.1.0'
 }
 
 artifacts {

@@ -6,6 +6,7 @@ import java.io.OutputStream;
 import java.util.concurrent.Executor;
 
 import org.threadly.util.ExceptionUtils;
+import org.threadly.util.StringUtils;
 
 public class RunHelper {
   private static final boolean VERBOSE = false;
@@ -110,7 +111,7 @@ public class RunHelper {
       if (startsWithShell(command) && command.length == 3) {
         System.out.println("Running command: " + command[2]);
       } else {
-        System.out.println("Running command: \n" + getCommandStr(command, true));
+        System.out.println("Running command: " + StringUtils.NEW_LINE + getCommandStr(command, true));
       }
     }
   }
@@ -133,7 +134,7 @@ public class RunHelper {
       }
       if (! first) {
         if (formatedForLogging) {
-          sb.append('\n');
+          sb.append(StringUtils.NEW_LINE);
         } else {
           sb.append(' ');
         }
